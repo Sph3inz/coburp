@@ -38,7 +38,7 @@ if args.reset_index:
 # Initialize the Gemini services
 embedding_service = GeminiEmbeddingService(
     api_key=GEMINI_API_KEY,
-    model="all-mpnet-base-v2"  # Using a sentence-transformers model
+    model="all-MiniLM-L6-v2"  # Using a faster embedding model
 )
 llm_service = GeminiLLMService(
     model="gemini-2.0-flash-lite-preview-02-05",  # Gemini model name
@@ -49,12 +49,20 @@ llm_service = GeminiLLMService(
     temperature=0.7
 )
 
-# Create a GraphRAG instance that uses the Gemini services
+# Create a GraphRAG instance that uses the Gemini services with comprehensive entity types
 grag = GraphRAG(
     working_dir="./graphdata",         # Directory to store data
-    domain="Example Domain",           # Domain description
-    example_queries="This is a sample query example.",
-    entity_types=["Article", "Document"],
+    domain="Universal Domain",         # Updated domain description
+    example_queries=[
+         "Summarize the key concepts in the provided text.",
+         "What are the primary entities mentioned in the text?"
+    ],
+    entity_types=[
+         "named", "generic", "numerical", "date", "location", 
+         "organization", "person", "concept", "event", "miscellaneous",
+         "product", "technology", "industry", "software", "hardware", 
+         "protocol", "risk", "vulnerability", "threat"
+    ],
     config=GraphRAG.Config(
         llm_service=llm_service,
         embedding_service=embedding_service

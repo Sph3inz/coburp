@@ -19,6 +19,7 @@ import datetime
 import aiofiles
 import os
 import shutil
+import pickle
 
 import numpy as np
 from pydantic import BaseModel, ValidationError
@@ -40,6 +41,9 @@ from fast_graphrag._models import _json_schema_slim
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.ERROR)
+
+# NEW: Global flag to track if the first markdown writeup has been saved.
+FIRST_WRITEUP_SAVED = False
 
 T_model = TypeVar("T_model")
 
@@ -89,7 +93,7 @@ class GeminiEmbeddingService(BaseEmbeddingService):
     # Custom configuration for embedding model
     embedding_dim: int = field(default=768)  # Embedding dimension
     max_elements_per_request: int = field(default=32)  # Batch size
-    model: Optional[str] = field(default="all-mpnet-base-v2")  # Model name
+    model: Optional[str] = field(default="all-MiniLM-L6-v2")  # Model name
     api_key: Optional[str] = field(default=None)  # Not used for sentence-transformers
     _model: Optional[SentenceTransformer] = field(default=None, init=False)
     device: Optional[str] = field(default=None)  # NEW: Device setting for model (e.g. "cuda" or "cpu")
@@ -234,9 +238,9 @@ class GeminiLLMService(BaseLLMService):
         return text
 
     @throttle_async_func_call(
-        max_concurrent=20,  # Reduced from 50
-        stagger_time=0.2,  # Increased from 0.1
-        waiting_time=0.005  # Increased from 0.001
+        max_concurrent=2048,
+        stagger_time=0.0,
+        waiting_time=0.001
     )
     async def send_message(
         self,
@@ -297,7 +301,7 @@ class GeminiLLMService(BaseLLMService):
                 # Configure generation parameters
                 generation_config = genai.types.GenerationConfig(
                     temperature=temperature,
-                    candidate_count=1,
+                    candidate_count=5,
                     top_p=0.8,
                     top_k=40,
                 )
@@ -308,26 +312,33 @@ class GeminiLLMService(BaseLLMService):
                     generation_config=generation_config,
                 )
 
-                # Validate response
-                if not response or not response.text:
-                    logger.error("Empty response from Gemini")
-                    raise LLMServiceNoResponseError("Empty response from Gemini")
+                if not response:
+                    raise Exception("Empty response from Gemini")
 
-                # Clean and extract JSON from response
-                response_text = self._clean_json_response(response.text)
-
-                # Parse response using response_model if provided
-                try:
-                    if response_model:
-                        if issubclass(response_model, BaseModelAlias):
-                            llm_response = response_model.Model.model_validate_json(response_text)
-                        else:
-                            llm_response = response_model.model_validate_json(response_text)
+                # If response contains multiple candidates, pick the first candidate's text.
+                if hasattr(response, "candidates") and response.candidates:
+                    candidate = response.candidates[0]
+                    if hasattr(candidate, "content"):
+                        candidate_text = candidate.content
+                    elif hasattr(candidate, "text"):
+                        candidate_text = candidate.text
+                    elif hasattr(candidate, "parts") and candidate.parts:
+                        candidate_text = " ".join(candidate.parts)
                     else:
-                        llm_response = response_text
-                except ValidationError as e:
-                    logger.error(f"JSON validation error: {str(e)}\nResponse text: {response_text}")
-                    raise LLMServiceNoResponseError(f"Invalid JSON response: {str(e)}") from e
+                        raise Exception("No valid text field in candidate response")
+                    response_text = self._clean_json_response(candidate_text)
+                elif hasattr(response, "text"):
+                    response_text = self._clean_json_response(response.text)
+                else:
+                    raise Exception("No valid text response from Gemini")
+
+                if response_model:
+                    if issubclass(response_model, BaseModelAlias):
+                        llm_response = response_model.Model.model_validate_json(response_text)
+                    else:
+                        llm_response = response_model.model_validate_json(response_text)
+                else:
+                    llm_response = response_text
 
                 self.llm_calls_count += 1
 
@@ -476,6 +487,7 @@ async def crawl_url(url: str) -> Optional[Tuple[str, Dict[str, Any]]]:
 # NEW: Function to batch process links and insert into GraphRAG
 async def process_link_batch(grag, urls: List[str], insert_queue: asyncio.Queue) -> None:
     """Process a batch of URLs and insert their content into GraphRAG."""
+    global FIRST_WRITEUP_SAVED
     contents_and_metadata = []
     
     # Crawl all URLs concurrently instead of sequentially
@@ -487,6 +499,11 @@ async def process_link_batch(grag, urls: List[str], insert_queue: asyncio.Queue)
             print(f"[Error] Failed to process {url}: {str(result)}")
         elif result:
             content, metadata = result
+            if not FIRST_WRITEUP_SAVED and content.strip().startswith("#"):
+                with open("first_writeup.md", "w", encoding="utf-8") as fw:
+                    fw.write(content)
+                print("[Info] First markdown writeup saved to 'first_writeup.md'")
+                FIRST_WRITEUP_SAVED = True
             contents_and_metadata.append((content, metadata))
     
     # Enqueue all successful crawls for insertion
@@ -576,9 +593,11 @@ async def continuous_crawl_loop(grag, start_link_index: int = 0, insert_queue: a
                 batch = new_links[i:i + BATCH_SIZE]
                 print(f"\n[Batch {current_batch}/{total_batches}] Processing {len(batch)} links...")
                 await process_link_batch(grag, batch, insert_queue)
-                
-                # Reduced delay between batches
-                if i + BATCH_SIZE < len(new_links):  # Only delay if there are more batches to process
+                # Wait until the current batch is fully inserted before proceeding
+                await insert_queue.join()
+
+                # Reduced delay between batches if there are more batches to process
+                if i + BATCH_SIZE < len(new_links):
                     print(f"[Info] Waiting 2 seconds before processing batch {current_batch + 1}...")
                     await asyncio.sleep(2)
         else:
@@ -628,13 +647,65 @@ if __name__ == "__main__":
         else:
             print("[Info] No existing index found to reset.")
 
+    # NEW: Ensure the working directory and metadata file exist before initializing GraphRAG.
+    working_dir = Path("./graphdata")
+    if not working_dir.exists():
+        working_dir.mkdir(parents=True, exist_ok=True)
+        print("[Info] Created working directory './graphdata'.")
+
+    metadata_file = working_dir / "entities_hnsw_metadata.pkl"
+    if metadata_file.exists():
+        try:
+            with metadata_file.open("rb") as f:
+                pickle.load(f)
+        except Exception as exc:
+            print("[Info] Existing metadata file is corrupted or not loadable. Recreating metadata file.")
+            with metadata_file.open("wb") as f:
+                pickle.dump({}, f)
+    else:
+        print("[Info] Creating empty metadata file for vectordb storage.")
+        with metadata_file.open("wb") as f:
+            pickle.dump({}, f)
+    
+    # NEW: Create additional required files with default content if they do not exist.
+    import gzip
+
+    graph_file = working_dir / "graph_igraph_data.pklz"
+    if not graph_file.exists():
+        print("[Info] Creating default empty graph file for graph storage.")
+        try:
+            import igraph
+            empty_graph = igraph.Graph()
+        except ImportError:
+            empty_graph = {}
+        with gzip.open(str(graph_file), "wb") as f:
+            pickle.dump(empty_graph, f)
+
+    chunks_file = working_dir / "chunks_kv_data.pkl"
+    if not chunks_file.exists():
+        print("[Info] Creating empty file for key-vector storage.")
+        with chunks_file.open("wb") as f:
+            pickle.dump({}, f)
+
+    r2c_file = working_dir / "map_r2c_blob_data.pkl"
+    if not r2c_file.exists():
+        print("[Info] Creating empty file for map_r2c blob storage.")
+        with r2c_file.open("wb") as f:
+            pickle.dump({}, f)
+
+    e2r_file = working_dir / "map_e2r_blob_data.pkl"
+    if not e2r_file.exists():
+        print("[Info] Creating empty file for map_e2r blob storage.")
+        with e2r_file.open("wb") as f:
+            pickle.dump({}, f)
+
     # Sample API key (replace with your actual key)
     GEMINI_API_KEY = "AIzaSyAwjj3FkVASfvXfY71jla-fAhlpGF9Bdnc"
     
     # Initialize Gemini services with an existing API key.
     embedding_service = GeminiEmbeddingService(
         api_key=GEMINI_API_KEY,
-        model="all-mpnet-base-v2"  # Use the sentence-transformers model
+        model="all-MiniLM-L6-v2"  # Use the faster embedding model
     )
     
     llm_service = GeminiLLMService(
@@ -662,8 +733,8 @@ if __name__ == "__main__":
     insert_queue = asyncio.Queue(maxsize=1000)
 
     async def main_async():
-        # Start insertion worker tasks within the event loop
-        NUM_WORKERS = 10  # Adjust number of workers as needed
+        # Start insertion worker task (single worker for sequential processing)
+        NUM_WORKERS = 1  # Process links in order sequentially
         for _ in range(NUM_WORKERS):
             asyncio.create_task(insertion_worker(grag, insert_queue))
 
