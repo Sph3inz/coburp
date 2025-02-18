@@ -16,9 +16,9 @@ import signal
 import sys
 from pathlib import Path
 import datetime
-import aiofiles  # NEW: For asynchronous file I/O
-import os  # NEW: For checking and deleting index folder
-import shutil  # NEW: For deleting the index folder
+import aiofiles
+import os
+import shutil
 
 import numpy as np
 from pydantic import BaseModel, ValidationError
@@ -43,8 +43,15 @@ logging.basicConfig(level=logging.ERROR)
 
 T_model = TypeVar("T_model")
 
-# NEW IMPORTS for Crawl4AI:
-from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig, CacheMode
+# Updated imports for Crawl4AI:
+from crawl4ai import (
+    AsyncWebCrawler, 
+    BrowserConfig, 
+    CrawlerRunConfig, 
+    CacheMode,
+    PruningContentFilter,
+    DefaultMarkdownGenerator
+)
 
 RETRY_TIME_REGEX = re.compile(r'Retry after (\d+) seconds')  # NEW: Pre-compiled regex for retry extraction
 
@@ -377,48 +384,94 @@ async def crawl_url(url: str) -> Optional[Tuple[str, Dict[str, Any]]]:
     """Crawls the given URL and returns content and metadata if successful."""
     browser_config = BrowserConfig(
         headless=True,
-        verbose=True
+        verbose=False,
+        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        viewport_width=1920,
+        viewport_height=1080
+    )
+    
+    # Create content filter for better content extraction
+    content_filter = PruningContentFilter(
+        threshold=0.5,
+        min_word_threshold=50
+    )
+    
+    # Create markdown generator with options
+    markdown_generator = DefaultMarkdownGenerator(
+        content_filter=content_filter,
+        options={
+            "heading_style": "atx",
+            "bullet_char": "*",
+            "code_block_style": "fenced",
+            "preserve_emphasis": True,
+            "preserve_tables": True,
+            "preserve_links": False,
+            "preserve_images": False,
+            "escape_html": False,
+            "wrap_width": 100,
+            "ignore_links": True,
+            "ignore_images": True,
+            "skip_internal_links": True
+        }
     )
     
     run_config = CrawlerRunConfig(
         word_count_threshold=10,
-        excluded_tags=['form', 'header', 'footer', 'nav'],
+        excluded_tags=['form', 'header', 'footer', 'nav', 'script', 'style', 'noscript'],
         exclude_external_links=True,
         remove_overlay_elements=True,
         process_iframes=True,
         cache_mode=CacheMode.BYPASS,
+        js_code="window.scrollTo(0, document.body.scrollHeight);",  # Scroll to bottom
+        wait_until="networkidle",  # Wait for network to be idle
+        page_timeout=60000,  # Increase timeout to 60 seconds
+        verbose=False,  # Reduce verbose output
+        markdown_generator=markdown_generator
     )
     
     print(f"\n[Crawling] {url}")
-    async with AsyncWebCrawler(config=browser_config) as crawler:
-        result = await crawler.arun(url=url, config=run_config)
-        if result.success:
-            content = None
-            if result.markdown_v2:
-                content = result.markdown_v2.raw_markdown
-            elif result.markdown:
-                content = result.markdown if isinstance(result.markdown, str) else result.markdown.raw_markdown
-            elif result.cleaned_html:
-                content = result.cleaned_html
-            elif result.html:
-                content = result.html
+    try:
+        async with AsyncWebCrawler(config=browser_config) as crawler:
+            result = await crawler.arun(url=url, config=run_config)
+            
+            if result.success:
+                content = None
+                # Only process successful crawls with actual content
+                if result.markdown_v2 and result.markdown_v2.raw_markdown and result.markdown_v2.raw_markdown.strip():
+                    content = result.markdown_v2.raw_markdown
+                elif result.markdown and (isinstance(result.markdown, str) and result.markdown.strip() or 
+                                       hasattr(result.markdown, 'raw_markdown') and result.markdown.raw_markdown.strip()):
+                    content = result.markdown if isinstance(result.markdown, str) else result.markdown.raw_markdown
+                elif result.fit_markdown and result.fit_markdown.strip():
+                    content = result.fit_markdown
+                elif result.cleaned_html and result.cleaned_html.strip():
+                    content = f"""
+# {result.metadata.get('title', 'Untitled Page')}
+
+{result.cleaned_html}
+"""
                 
-            if content:
-                metadata = {
-                    "url": url,
-                    "title": result.metadata.get("title") if result.metadata else None,
-                    "crawl_time": str(datetime.datetime.now()),
-                }
-                print(f"[Success] Crawled {url}")
-                if result.metadata and result.metadata.get("title"):
-                    print(f"[Info] Title: {result.metadata['title']}")
-                return content, metadata
+                if content and content.strip():
+                    metadata = {
+                        "url": url,
+                        "title": result.metadata.get("title") if result.metadata else None,
+                        "crawl_time": str(datetime.datetime.now()),
+                        "success": True
+                    }
+                    print(f"[Success] Crawled {url}")
+                    if result.metadata and result.metadata.get("title"):
+                        print(f"[Info] Title: {result.metadata['title']}")
+                    return content, metadata
+                else:
+                    print(f"[Warn] No usable content found for {url}")
+                    return None
             else:
-                print(f"[Warn] No usable content found for {url}")
+                print(f"[Error] Failed to crawl {url}: {result.error_message}")
                 return None
-        else:
-            print(f"[Error] Failed to crawl {url}: {result.error_message}")
-            return None
+                
+    except Exception as e:
+        print(f"[Error] Exception while crawling {url}: {str(e)}")
+        return None
 
 # NEW: Function to batch process links and insert into GraphRAG
 async def process_link_batch(grag, urls: List[str], insert_queue: asyncio.Queue) -> None:
