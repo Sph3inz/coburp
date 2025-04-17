@@ -21,7 +21,7 @@ target/
 *.zip
 *.tar.gz
 *.rar
-
+.env
 # virtual machine crash logs
 hs_err_pid*
 replay_pid*
